@@ -1,0 +1,5 @@
+python-telegram-bot
+numpy
+scikit-learn
+faster-whisper
+lexrank
