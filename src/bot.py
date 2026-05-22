@@ -133,7 +133,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             
             is_important = importance_data["is_important"]
             imp_score = importance_data["score"]
-            alert_icon = "🔴 СРОЧНО / ВАЖНО" if is_important else "🟢 Обычное сообщение"
+            if imp_score >= 0.70:
+                alert_icon = "🔴 Ваш собеседник уже красный"
+            elif imp_score >= 0.40:
+                # Зона неуверенности модели (от 40% до 70%)
+                alert_icon = "🟡 Неоднозначно (стоит прослушать на x2)"
+            else:
+                alert_icon = "🟢 Заблокируйте собеседника(воздух гоняет) "
 
             # Сборка финального сообщения
             response = (
