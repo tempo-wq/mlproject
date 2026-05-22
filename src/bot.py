@@ -1,7 +1,8 @@
 """
-Telegram-бот для транскрибации и суммаризации голосовых сообщений.
+Telegram-бот для транскрибации, суммаризации и оценки важности голосовых сообщений.
 Транскрибация: faster-whisper (speech-to-text)
 Суммаризация: классический ML (TF-IDF + TextRank)
+Важность: Zero-Shot NLP (ruBERT-tiny)
 """
 
 import os
@@ -20,10 +21,12 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+# Импорты локальных ML модулей
 from transcriber import Transcriber
 from summarizer import Summarizer
+from importance import ImportanceScorer
 
-# СНАЧАЛА создаем папку:
+# СНАЧАЛА создаем папку для логов:
 Path("logs").mkdir(exist_ok=True)
 
 # ПОТОМ настраиваем логи:
@@ -37,20 +40,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация моделей (один раз при старте)
+# Инициализация моделей (один раз при старте бота)
+logger.info("Инициализация ML-моделей...")
 transcriber = Transcriber(model_size="small")
 summarizer = Summarizer()
+importance_scorer = ImportanceScorer()
+logger.info("Все модели успешно загружены!")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Приветственное сообщение."""
     text = (
-        "👋 *Привет!* Я бот для расшифровки и суммаризации голосовых сообщений.\n\n"
+        "👋 *Привет!* Я бот для анализа голосовых сообщений.\n\n"
         "📩 *Что умею:*\n"
-        "• Перешли мне голосовое сообщение — я расшифрую его текстом\n"
-        "• Автоматически сделаю краткую выжимку\n"
-        "• Работает на русском и английском\n\n"
-        "🎙️ Просто перешли голосовое — и я всё сделаю!"
+        "• Расшифрую аудио в текст (Whisper)\n"
+        "• Сделаю краткую выжимку главного (TextRank)\n"
+        "• Оценю важность и срочность сообщения (ruBERT-tiny)\n\n"
+        "🎙️ Просто перешли мне голосовое или аудиофайл!"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -60,8 +66,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = (
         "ℹ️ *Справка*\n\n"
         "1. Перешли боту голосовое сообщение\n"
-        "2. Бот расшифрует его с помощью Whisper\n"
-        "3. Затем модель TF-IDF + TextRank выделит главное\n\n"
+        "2. Бот обработает его через каскад ML-моделей без блокировки интерфейса\n\n"
         "Команды:\n"
         "/start — начало работы\n"
         "/help — эта справка\n"
@@ -96,49 +101,59 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         return
 
-    # Уведомляем пользователя
     status_msg = await message.reply_text("⏳ Обрабатываю аудио...")
 
     try:
-        # Скачиваем файл во временную директорию
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = Path(tmpdir) / f"audio{file_ext}"
             file = await context.bot.get_file(file_obj.file_id)
             await file.download_to_drive(audio_path)
 
-            # Транскрибация
+            # 1. ТРАНСКРИБАЦИЯ (в отдельном потоке)
             await status_msg.edit_text("🔊 Расшифровываю речь...")
-            transcript, language, duration = transcriber.transcribe(str(audio_path))
+            transcript, language, duration = await asyncio.to_thread(
+                transcriber.transcribe, str(audio_path)
+            )
 
             if not transcript.strip():
                 await status_msg.edit_text("❌ Не удалось распознать речь. Попробуй другое аудио.")
                 return
 
-            # Суммаризация
-            await status_msg.edit_text("📝 Делаю выжимку...")
-            summary = summarizer.summarize(transcript)
+            # 2. СУММАРИЗАЦИЯ (в отдельном потоке)
+            await status_msg.edit_text("📝 Делаю выжимку главного...")
+            summary = await asyncio.to_thread(summarizer.summarize, transcript)
 
-            # Формируем ответ
+            # 3. ОЦЕНКА ВАЖНОСТИ (в отдельном потоке)
+            await status_msg.edit_text("🔍 Оцениваю важность текста...")
+            importance_data = await asyncio.to_thread(importance_scorer.score, transcript)
+
+            # Формируем метаданные для ответа
             word_count = len(transcript.split())
             compress_ratio = len(summary.split()) / max(word_count, 1)
+            
+            is_important = importance_data["is_important"]
+            imp_score = importance_data["score"]
+            alert_icon = "🔴 СРОЧНО / ВАЖНО" if is_important else "🟢 Обычное сообщение"
 
+            # Сборка финального сообщения
             response = (
                 f"🎙️ *Расшифровка* (язык: {language.upper()}, {duration:.0f} сек):\n"
                 f"```\n{transcript}\n```\n\n"
                 f"📌 *Краткая выжимка* (~{compress_ratio:.0%} от оригинала):\n"
-                f"{summary}"
+                f"{summary}\n\n"
+                f"📊 *Статус*: {alert_icon} (Уверенность: {imp_score:.0%})"
             )
 
             await status_msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
 
-            # Обновляем статистику
+            # Обновляем статистику бота
             context.bot_data["processed"] = context.bot_data.get("processed", 0) + 1
             context.bot_data["total_words"] = context.bot_data.get("total_words", 0) + word_count
 
-            logger.info(f"Processed voice: {word_count} words, lang={language}")
+            logger.info(f"Успешно обработано: {word_count} слов, важность={is_important}")
 
     except Exception as e:
-        logger.error(f"Error processing voice: {e}", exc_info=True)
+        logger.error(f"Ошибка при обработке аудио: {e}", exc_info=True)
         await status_msg.edit_text(
             "❌ Произошла ошибка при обработке. Попробуй ещё раз."
         )
@@ -146,7 +161,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик для пересланных голосовых."""
-    # Пересланные голосовые попадают в тот же обработчик через filters.VOICE
     await handle_voice(update, context)
 
 
@@ -162,7 +176,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
-    logger.info("Бот запущен...")
+    logger.info("Бот запущен и готов к работе...")
     app.run_polling(drop_pending_updates=True)
 
 
